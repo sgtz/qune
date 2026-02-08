@@ -39,9 +39,13 @@ q)count t
 ## Commands
 
 ```bash
-q qdust.q test file.q       # run tests
-q qdust.q diff file.q       # show diff
-q qdust.q promote file.q    # accept changes
+q qdust.q test                  # run all tests in project (.qd/.git root)
+q qdust.q test --filter math    # filter project files by name
+q qdust.q test dir/             # run tests in directory
+q qdust.q test file.q           # run tests in single file
+q qdust.q promote dir/          # accept all .corrected files
+q qdust.q promote file.q        # accept single file
+q qdust.q check                 # fail if .corrected files exist (CI)
 ```
 
 ## Loading (.t files)
@@ -50,14 +54,17 @@ q qdust.q promote file.q    # accept changes
 
 **Explicit:** `/ @load lib.q`
 
+**Prefix substitution:** `tests/foo.t` resolves `src/foo.q`
+
 ## Options
 
 ```
+--filter <pat>  Filter project files by name/glob
+--fn <name>     Run only tests for named function
 --init <file>   Load init file
 --json          JSON output
 --junit         JUnit XML output
 --errors-only   Show only failures
---fn <label>    Run only tests with label
 ```
 
 ## Environment
