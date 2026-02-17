@@ -1,0 +1,447 @@
+#!/bin/bash
+# qdust — Q expect test runner wrapper
+#
+# When Q is available, delegates everything to q qdust.q.
+# When Q is not available, handles review/promote commands in pure shell.
+# Remote hooks (deploy/test/ingest) always run in shell.
+#
+# Usage:
+#   qdust test file.q                       Run tests (requires Q)
+#   qdust test dir/ diff:ide                Run tests, open IDE diff
+#   qdust -debug test file.q                Debug single file (q)) on error)
+#   qdust -debug test dir/                  Debug all files (generates script)
+#   qdust promote file.q                    Accept .corrected
+#   qdust promote dir/                      Accept all .corrected in directory
+#   qdust status [dir]                      List pending .corrected files
+#   qdust diff [file|dir]                   Show diffs (terminal)
+#   qdust diff [file|dir] --ide             Show diffs (external tool)
+#   qdust clean [dir]                       Discard .corrected files
+#   qdust check [dir]                       Fail if .corrected files exist (CI)
+#   qdust gitignore                         Add *.corrected to .gitignore
+#   qdust remote deploy                     Push files to server
+#   qdust remote test                       Trigger remote test run
+#   qdust remote ingest                     Pull .corrected files back
+#   qdust remote deploy test ingest         Chain multiple steps
+#   qdust remote cycle                      Shorthand for deploy test ingest
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR/env.sh" ]] && source "$SCRIPT_DIR/env.sh"
+
+QDUST_LIB="$SCRIPT_DIR/qdust.q"
+
+# ============================================================================
+# Q detection
+# ============================================================================
+
+Q_EXEC="${QDUST_Q:-}"
+if [[ -z "$Q_EXEC" ]]; then
+  Q_EXEC="$(command -v q 2>/dev/null || true)"
+  if [[ -z "$Q_EXEC" ]]; then
+    # Warn but don't exit — shell-only commands still work without Q
+    QDUST_NO_Q_WARN="Warning: q not found. Set QDUST_Q or add q to PATH."
+  fi
+fi
+
+has_q() {
+  [[ -n "$Q_EXEC" && -x "$Q_EXEC" && -f "$QDUST_LIB" ]]
+}
+
+# ============================================================================
+# Q mode — delegate to q qdust.q
+# ============================================================================
+
+# rlwrap: readline wrapper for Q's console (line editing, history, color).
+# env.sh sets QDUST_RLWRAP and QDUST_RLWRAP_OPTS with sensible defaults.
+RLWRAP_BIN="${QDUST_RLWRAP:-}"
+RLWRAP_OPTS="${QDUST_RLWRAP_OPTS:--A -pYELLOW -c -r -H ~/.q_history}"
+
+GEN_DIR="${QDUST_DEBUG_DIR:-$SCRIPT_DIR/generated}"
+
+run_q() {
+  if [[ -n "$RLWRAP_BIN" ]]; then
+    "$RLWRAP_BIN" $RLWRAP_OPTS "$Q_EXEC" "$QDUST_LIB" "$@"
+  else
+    "$Q_EXEC" "$QDUST_LIB" "$@"
+  fi
+}
+
+exec_q() {
+  if [[ -n "$RLWRAP_BIN" ]]; then
+    exec "$RLWRAP_BIN" $RLWRAP_OPTS "$Q_EXEC" "$QDUST_LIB" "$@"
+  else
+    exec "$Q_EXEC" "$QDUST_LIB" "$@"
+  fi
+}
+
+run_via_q() {
+  if [[ " $* " == *" -debug "* ]]; then
+    export QDUST_DEBUG_PID=$$
+    run_q "$@"
+    DEBUG_PTR="$GEN_DIR/.debug-script-$$"
+    if [[ -f "$DEBUG_PTR" ]]; then
+      DEBUG_SCRIPT=$(cat "$DEBUG_PTR")
+      rm -f "$DEBUG_PTR"
+      [[ -f "$DEBUG_SCRIPT" ]] && exec bash "$DEBUG_SCRIPT"
+    fi
+  else
+    exec_q "$@"
+  fi
+}
+
+# ============================================================================
+# Shell mode — pure shell fallback for non-test commands
+# ============================================================================
+
+find_corrected() {
+  find "${1:-.}" -name "*.corrected" 2>/dev/null | sort
+}
+
+get_diff_tool() {
+  if [[ -n "$QDUST_DIFF_TOOL" ]]; then
+    echo "$QDUST_DIFF_TOOL"
+    return
+  fi
+  case "$(uname)" in
+    Darwin) echo "opendiff" ;;
+    Linux)  echo "meld" ;;
+    *)      echo "vimdiff" ;;
+  esac
+}
+
+shell_status() {
+  local dir="${1:-.}"
+  local files
+  files=$(find_corrected "$dir")
+  if [[ -z "$files" ]]; then
+    echo "No pending corrections"
+    exit 0
+  fi
+  while IFS= read -r cf; do
+    local orig="${cf%.corrected}"
+    echo "  $orig  ->  $cf"
+  done <<< "$files"
+  local n
+  n=$(echo "$files" | wc -l | tr -d ' ')
+  echo "$n file(s) with pending corrections"
+  exit 1
+}
+
+shell_diff() {
+  local target="${1:-.}"
+  local ide="$2"
+
+  if [[ -f "$target" ]]; then
+    local cf="${target}.corrected"
+    if [[ ! -f "$cf" ]]; then
+      echo "No .corrected file for $target"
+      exit 1
+    fi
+    if [[ "$ide" == "--ide" ]]; then
+      $(get_diff_tool) "$target" "$cf"
+    else
+      diff -u "$target" "$cf" || true
+    fi
+  elif [[ -d "$target" ]]; then
+    local files
+    files=$(find_corrected "$target")
+    if [[ -z "$files" ]]; then
+      echo "No .corrected files found"
+      exit 0
+    fi
+    while IFS= read -r cf; do
+      local orig="${cf%.corrected}"
+      if [[ -f "$orig" ]]; then
+        if [[ "$ide" == "--ide" ]]; then
+          $(get_diff_tool) "$orig" "$cf"
+        else
+          diff -u "$orig" "$cf" || true
+        fi
+      fi
+    done <<< "$files"
+  else
+    echo "Not found: $target" >&2
+    exit 1
+  fi
+}
+
+shell_promote() {
+  local target="${1:-.}"
+
+  if [[ -f "$target" ]]; then
+    local cf="${target}.corrected"
+    if [[ ! -f "$cf" ]]; then
+      echo "No .corrected file for $target"
+      exit 1
+    fi
+    mv "$cf" "$target"
+    echo "Promoted $target"
+  elif [[ -d "$target" ]]; then
+    local files
+    files=$(find_corrected "$target")
+    if [[ -z "$files" ]]; then
+      echo "No .corrected files to promote"
+      exit 0
+    fi
+    local n=0
+    while IFS= read -r cf; do
+      local orig="${cf%.corrected}"
+      mv "$cf" "$orig"
+      n=$((n + 1))
+    done <<< "$files"
+    echo "Promoted $n file(s)"
+  else
+    echo "Not found: $target" >&2
+    exit 1
+  fi
+}
+
+shell_clean() {
+  local dir="${1:-.}"
+  local files
+  files=$(find_corrected "$dir")
+  if [[ -z "$files" ]]; then
+    echo "No .corrected files to clean"
+    exit 0
+  fi
+  local n=0
+  while IFS= read -r cf; do
+    rm -f "$cf"
+    n=$((n + 1))
+  done <<< "$files"
+  echo "Removed $n .corrected file(s)"
+}
+
+shell_check() {
+  local dir="${1:-.}"
+  local files
+  files=$(find_corrected "$dir")
+  if [[ -z "$files" ]]; then
+    echo "OK: No .corrected files found"
+    exit 0
+  fi
+  local n
+  n=$(echo "$files" | wc -l | tr -d ' ')
+  echo "ERROR: Found $n stale .corrected file(s)" >&2
+  echo "" >&2
+  echo "Run 'qdust promote' or fix tests:" >&2
+  while IFS= read -r cf; do
+    echo "  $cf" >&2
+  done <<< "$files"
+  exit 1
+}
+
+shell_gitignore() {
+  local gi=".gitignore"
+  local pattern="*.corrected"
+  if [[ -f "$gi" ]] && grep -qxF "$pattern" "$gi"; then
+    echo ".gitignore already contains qdust patterns"
+    exit 0
+  fi
+  echo "$pattern" >> "$gi"
+  echo "Added to .gitignore:"
+  echo "  $pattern"
+}
+
+shell_help() {
+  echo "qdust — Q/K Expect Test Runner"
+  echo ""
+  echo "Usage:"
+  echo "  qdust test <target>              Run tests (requires Q)"
+  echo "  qdust promote [file|dir]         Accept .corrected files"
+  echo "  qdust status [dir]               List pending .corrected files"
+  echo "  qdust diff [file|dir] [--ide]    Show diffs"
+  echo "  qdust clean [dir]                Discard .corrected files"
+  echo "  qdust check [dir]                Fail if .corrected files exist (CI)"
+  echo "  qdust gitignore                  Add *.corrected to .gitignore"
+  echo ""
+  echo "Remote hooks:"
+  echo "  qdust remote deploy              Push files to server"
+  echo "  qdust remote test                Trigger remote test run"
+  echo "  qdust remote ingest              Pull .corrected files back"
+  echo "  qdust remote deploy test ingest  Chain steps left-to-right"
+  echo "  qdust remote cycle               Shorthand for deploy test ingest"
+  echo ""
+  echo "Hooks are executable scripts in .qd/hooks/ (deploy, test, ingest)."
+  if has_q; then
+    echo ""
+    echo "Q is available — run 'qdust test' for full options."
+  else
+    echo ""
+    echo "Q not found — test command unavailable."
+    echo "Set QDUST_Q=/path/to/q or add q to PATH."
+  fi
+  exit 0
+}
+
+# ============================================================================
+# Remote hooks — deploy / test / ingest
+# ============================================================================
+
+# Find .qd directory by walking up from CWD
+find_qd_dir() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -e "$dir/.qd" ]]; then
+      # .qd can be a file (marker) or directory
+      # hooks live in .qd/hooks/ either way
+      echo "$dir/.qd"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+# Run a single hook step. Returns 0 on success, 1 on failure.
+run_hook() {
+  local hook_name="$1"
+  local qd_dir="$2"
+  local hooks_dir="$qd_dir/hooks"
+  local hook_path="$hooks_dir/$hook_name"
+
+  # Check skip env var
+  local skip_var="QDUST_SKIP_$(echo "$hook_name" | tr '[:lower:]' '[:upper:]')"
+  if [[ "${!skip_var}" == "1" ]]; then
+    echo "[$hook_name] skipped (${skip_var}=1)"
+    return 0
+  fi
+
+  # Check hook exists
+  if [[ ! -f "$hook_path" ]]; then
+    echo "$hook_name hook not defined ($hook_path)" >&2
+    return 1
+  fi
+  if [[ ! -x "$hook_path" ]]; then
+    echo "$hook_name hook not executable ($hook_path)" >&2
+    echo "  chmod +x $hook_path" >&2
+    return 1
+  fi
+
+  # Ingest wait: poll for flag file before running
+  if [[ "$hook_name" == "ingest" && -n "$QDUST_INGEST_WAIT" ]]; then
+    local timeout="${QDUST_INGEST_TIMEOUT:-60}"
+    local elapsed=0
+    echo "[ingest] waiting for $QDUST_INGEST_WAIT (timeout ${timeout}s)"
+    while [[ ! -f "$QDUST_INGEST_WAIT" ]]; do
+      if [[ $elapsed -ge $timeout ]]; then
+        echo "[ingest] timed out waiting for $QDUST_INGEST_WAIT" >&2
+        return 1
+      fi
+      sleep 2
+      elapsed=$((elapsed + 2))
+    done
+    rm -f "$QDUST_INGEST_WAIT"
+    echo "[ingest] flag file found, proceeding"
+  fi
+
+  echo "[${hook_name}] running $hook_path"
+  "$hook_path"
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    # Write lastRun timestamp
+    mkdir -p "$qd_dir"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$qd_dir/.lastrun.$hook_name"
+  fi
+
+  return $rc
+}
+
+cmd_remote() {
+  # Collect verbs from arguments
+  local verbs=()
+  for arg in "$@"; do
+    case "$arg" in
+      deploy|test|ingest) verbs+=("$arg") ;;
+      cycle) verbs+=("deploy" "test" "ingest") ;;
+      *)
+        echo "Unknown remote verb: $arg" >&2
+        echo "Valid verbs: deploy, test, ingest, cycle" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ ${#verbs[@]} -eq 0 ]]; then
+    echo "Usage: qdust remote <deploy|test|ingest|cycle> [...]" >&2
+    echo "" >&2
+    echo "Chain verbs: qdust remote deploy test ingest" >&2
+    echo "Shorthand:   qdust remote cycle" >&2
+    exit 1
+  fi
+
+  # Find .qd directory
+  local qd_dir
+  qd_dir=$(find_qd_dir)
+  if [[ $? -ne 0 ]]; then
+    echo "No .qd project root found (walk up from $PWD)" >&2
+    echo "Create a .qd file or directory at your project root." >&2
+    exit 1
+  fi
+
+  # Ensure hooks directory exists
+  local hooks_dir="$qd_dir/hooks"
+  if [[ ! -d "$hooks_dir" ]]; then
+    echo "No hooks directory at $hooks_dir" >&2
+    echo "Create it with your deploy/test/ingest scripts:" >&2
+    echo "  mkdir -p $hooks_dir" >&2
+    exit 1
+  fi
+
+  # Run verbs left-to-right, stop on failure
+  for verb in "${verbs[@]}"; do
+    run_hook "$verb" "$qd_dir" || exit 1
+  done
+}
+
+# ============================================================================
+# Dispatch
+# ============================================================================
+
+# QDUST_DEBUG env var — inject -debug flag if not already present
+if [[ "${QDUST_DEBUG:-}" == "1" && " $* " != *" -debug "* && " $* " != *" --debug "* ]]; then
+  set -- -debug "$@"
+fi
+
+# Extract first non-flag argument as command
+cmd=""
+for arg in "$@"; do
+  if [[ "$arg" != -* && "$arg" != diff:* ]]; then
+    cmd="$arg"
+    break
+  fi
+done
+
+# Remote hooks — always shell, handled before Q delegation
+if [[ "$cmd" == "remote" ]]; then
+  shift  # consume "remote"
+  cmd_remote "$@"
+  exit $?
+fi
+
+# If Q is available, delegate everything else
+if has_q; then
+  run_via_q "$@"
+  exit $?
+fi
+
+# No Q — handle what we can in shell
+case "$cmd" in
+  test)
+    [[ -n "${QDUST_NO_Q_WARN:-}" ]] && echo "$QDUST_NO_Q_WARN" >&2
+    echo "Error: 'test' requires Q." >&2
+    exit 1
+    ;;
+  status)   shift; shell_status "$@" ;;
+  diff)     shift; shell_diff "$@" ;;
+  promote)  shift; shell_promote "$@" ;;
+  clean)    shift; shell_clean "$@" ;;
+  check)    shift; shell_check "$@" ;;
+  gitignore) shell_gitignore ;;
+  help|-h|--help|"") shell_help ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "Run 'qdust help' for usage." >&2
+    exit 1
+    ;;
+esac
